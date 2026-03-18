@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Environment / secrets — NEVER commit these
+.env
+*.env
+
+# Bot output files (can be large; track separately if needed)
+results.csv
+error.log
+bot.log
+*.pid
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
