@@ -185,12 +185,19 @@ class PolymarketFeed:
 
     # ── WebSocket: live order book ───────────────────────────────────────────
 
+    # Correct WS endpoint — /ws/market (not /ws/ base)
+    WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
     async def run(self) -> None:
         """
         Persistent WebSocket loop. Subscribes to the active market's
         order book and maintains live price state.
         Reconnects automatically; re-discovers active market on each reconnect
         (market windows roll over every 5 minutes).
+
+        Correct subscription format (confirmed via testing):
+          URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
+          Message: {"assets_ids": [token_id_1, token_id_2], "type": "Market"}
         """
         backoff = 1
         while True:
@@ -205,7 +212,7 @@ class PolymarketFeed:
             try:
                 log.info(f"[Polymarket] Connecting WS for market {self.market_id}")
                 async with websockets.connect(
-                    self.clob_ws_url,
+                    self.WS_MARKET_URL,
                     ping_interval=20,
                     ping_timeout=10,
                     close_timeout=5,
@@ -213,11 +220,11 @@ class PolymarketFeed:
                     self._connected = True
                     backoff = 1
 
-                    # Subscribe to order book updates for both tokens
+                    # Subscribe to order book updates for both UP and DOWN tokens
+                    # Format confirmed: {"assets_ids": [...], "type": "Market"}
                     sub_msg = {
-                        "type": "subscribe",
-                        "channel": "order_book",
-                        "assets": [self.up_token_id, self.down_token_id],
+                        "assets_ids": [self.up_token_id, self.down_token_id],
+                        "type": "Market",
                     }
                     await ws.send(json.dumps(sub_msg))
                     log.info(f"[Polymarket] Subscribed to order book for {self.market_id}")
