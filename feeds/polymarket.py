@@ -33,6 +33,7 @@ from logger import log, log_error
 # ── Polymarket endpoint constants ────────────────────────────────────────────
 CLOB_REST = "https://clob.polymarket.com"
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+GAMMA_API = "https://gamma-api.polymarket.com"
 
 # Polymarket tags / slugs used to identify the active 5-min BTC market
 BTC_MARKET_KEYWORDS = ["bitcoin", "btc", "5-minute", "5 minute", "5min"]
@@ -75,85 +76,99 @@ class PolymarketFeed:
 
     async def fetch_active_market(self) -> bool:
         """
-        Query Polymarket CLOB REST API to find the currently active
-        5-minute BTC Up/Down market. Populates market_id, token IDs,
-        and market_end_ts.
+        Find the currently active 5-minute BTC Up/Down market.
+
+        The 5-minute markets use a deterministic slug pattern:
+            btc-updown-5m-{unix_timestamp}
+        where unix_timestamp is the window START time aligned to 300s boundaries.
+
+        We use the Gamma API (gamma-api.polymarket.com) to fetch the event,
+        then extract the conditionId and clobTokenIds for the UP/DOWN tokens.
 
         Returns True on success, False if no market found.
         """
+        import math
         try:
             async with aiohttp.ClientSession() as session:
-                # Get all active markets (paginated; limit 100 for BTC slug)
-                url = f"{self.clob_rest_url}/markets"
-                params = {"active": "true", "closed": "false", "limit": 100}
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        log_error(f"[Polymarket] REST /markets returned {resp.status}")
-                        return False
-                    data = await resp.json()
+                # Try the current and next 3 windows (in case current just expired)
+                now = time.time()
+                for offset in range(4):
+                    window_ts = int(math.floor(now / 300) * 300) + offset * 300
+                    slug = f"btc-updown-5m-{window_ts}"
+                    url = f"{GAMMA_API}/events"
+                    params = {"slug": slug}
+                    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+                        events = data if isinstance(data, list) else []
+                        if not events:
+                            continue
+                        event = events[0]
+                        markets = event.get("markets", [])
+                        if not markets:
+                            continue
+                        # Found a valid event — populate from it
+                        ok = self._populate_from_gamma_event(event, window_ts)
+                        if ok:
+                            log.info(
+                                f"[Polymarket] Active market: {self.market_id} | "
+                                f"UP_token={str(self.up_token_id)[:20]}... "
+                                f"DOWN_token={str(self.down_token_id)[:20]}... | "
+                                f"Ends: {self.market_end_ts} | slug={slug}"
+                            )
+                            return True
 
-            markets = data.get("data", []) if isinstance(data, dict) else data
-            log.info(f"[Polymarket] Fetched {len(markets)} active markets from REST")
-
-            best_market = self._pick_btc_5min_market(markets)
-            if best_market is None:
-                log_error("[Polymarket] No active 5-minute BTC market found")
-                return False
-
-            self._populate_from_market(best_market)
-            log.info(
-                f"[Polymarket] Active market: {self.market_id} | "
-                f"UP={self.up_token_id} DOWN={self.down_token_id} | "
-                f"Ends: {self.market_end_ts}"
-            )
-            return True
+            log_error("[Polymarket] No active 5-minute BTC market found")
+            return False
 
         except Exception as e:
             log_error("[Polymarket] fetch_active_market failed", e)
             return False
 
-    def _pick_btc_5min_market(self, markets: list) -> Optional[dict]:
+    def _populate_from_gamma_event(self, event: dict, window_ts: int) -> bool:
         """
-        Score candidate markets; pick the one that looks most like the
-        active 5-minute BTC Up/Down market.
+        Extract conditionId, clobTokenIds, and expiry from a Gamma API event.
+        The event contains a 'markets' array; the first market is the BTC Up/Down market.
+        clobTokenIds[0] = UP (Yes) token, clobTokenIds[1] = DOWN (No) token.
         """
-        candidates = []
-        for m in markets:
-            title = (m.get("question") or m.get("title") or "").lower()
-            description = (m.get("description") or "").lower()
-            combined = title + " " + description
-            # Must contain BTC/bitcoin AND 5-minute indicator
-            has_btc = any(kw in combined for kw in ["bitcoin", "btc"])
-            has_5min = any(kw in combined for kw in ["5-minute", "5 minute", "5min", "five minute"])
-            is_updown = any(kw in combined for kw in ["up", "down", "above", "below", "higher", "lower"])
-            if has_btc and has_5min and is_updown:
-                # Prefer the market expiring soonest (closest active window)
-                end_date = m.get("end_date_iso") or m.get("end_date") or ""
-                candidates.append((end_date, m))
+        try:
+            markets = event.get("markets", [])
+            if not markets:
+                return False
+            market = markets[0]
 
-        if not candidates:
-            return None
-        # Sort by expiry ascending; pick the next-to-expire (currently active)
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
+            # conditionId is the CLOB market identifier
+            self.market_id = market.get("conditionId") or market.get("condition_id")
+            if not self.market_id:
+                return False
+
+            # clobTokenIds: index 0 = UP/Yes, index 1 = DOWN/No
+            clob_token_ids = market.get("clobTokenIds", [])
+            if isinstance(clob_token_ids, str):
+                import json as _json
+                clob_token_ids = _json.loads(clob_token_ids)
+            if len(clob_token_ids) >= 2:
+                self.up_token_id = str(clob_token_ids[0])
+                self.down_token_id = str(clob_token_ids[1])
+            else:
+                return False
+
+            # Market ends at window_start + 300 seconds
+            self.market_end_ts = float(window_ts + 300)
+            return True
+
+        except Exception as e:
+            log_error("[Polymarket] _populate_from_gamma_event error", e)
+            return False
+
+    def _pick_btc_5min_market(self, markets: list) -> Optional[dict]:
+        """Legacy fallback — no longer used in primary discovery path."""
+        return None
 
     def _populate_from_market(self, market: dict) -> None:
-        """Extract condition_id, token IDs, and expiry from a market dict."""
-        self.market_id = market.get("condition_id") or market.get("id")
-        self.market_end_ts = self._parse_end_ts(
-            market.get("end_date_iso") or market.get("end_date")
-        )
-        tokens = market.get("tokens", [])
-        for token in tokens:
-            outcome = (token.get("outcome") or "").upper()
-            if outcome == "YES" or outcome == "UP":
-                self.up_token_id = token.get("token_id")
-            elif outcome == "NO" or outcome == "DOWN":
-                self.down_token_id = token.get("token_id")
-        # Fallback: assign by index if outcomes aren't labeled
-        if tokens and self.up_token_id is None and len(tokens) >= 2:
-            self.up_token_id = tokens[0].get("token_id")
-            self.down_token_id = tokens[1].get("token_id")
+        """Legacy fallback — no longer used in primary discovery path."""
+        pass
 
     @staticmethod
     def _parse_end_ts(end_date_str: Optional[str]) -> Optional[float]:
