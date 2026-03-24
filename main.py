@@ -87,7 +87,21 @@ async def signal_loop(
             # ── Check if Polymarket market has expired (new 5-min window) ────
             if polymarket_feed.refresh_if_expired():
                 log.info("[Main] Market window expired — re-fetching active market")
+                # Clear stale order book and force WS reconnect to new market
+                polymarket_feed._up_bids.clear()
+                polymarket_feed._up_asks.clear()
+                polymarket_feed._down_bids.clear()
+                polymarket_feed._down_asks.clear()
+                polymarket_feed._best_bid = None
+                polymarket_feed._best_ask = None
+                polymarket_feed.spread = None
                 ok = await polymarket_feed.fetch_active_market()
+                # Signal WS run() to reconnect with new token IDs (only once per window)
+                if not getattr(polymarket_feed, "_reconnect_triggered", False):
+                    polymarket_feed._force_reconnect = True
+                    polymarket_feed._reconnect_triggered = True
+                    # Reset the flag after the next window fetch completes
+                    asyncio.get_event_loop().call_later(10, lambda: setattr(polymarket_feed, "_reconnect_triggered", False))
                 if not ok:
                     log.warning("[Main] No active market found — waiting 15s")
                     await asyncio.sleep(15)
